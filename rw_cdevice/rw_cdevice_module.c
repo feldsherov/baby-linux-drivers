@@ -8,6 +8,7 @@
 #define MAX_DEV 2
 #define RWCDEV_BUFFER_SIZE (1 << 10)
 #define RWCDEV_NAME "rw_cdevice"
+#define IN_USE_MASK 1
 
 static ssize_t rw_cdevice_read(struct file *, char *, size_t, loff_t *);
 
@@ -21,6 +22,8 @@ static int rw_cdevice_release(struct inode *inode, struct file *file);
 
 struct rw_cdevice_data {
     struct cdev cdev;
+    atomic_t busy_flag;
+
     char data[RWCDEV_BUFFER_SIZE];
     struct circ_buf crc;
 };
@@ -46,7 +49,7 @@ size_t copy_from_user_to_crc(const char *from, size_t size, struct circ_buf* crc
 
     rest = copy_from_user(crc->buf + crc->head, from, to_write);
     transferred = to_write - rest;
-    crc->head = (crc->head + transferred) & (RWCDEV_BUFFER_SIZE - 1);    
+    crc->head = (crc->head + transferred) & (RWCDEV_BUFFER_SIZE - 1);
 
     return transferred;
 }
@@ -60,7 +63,7 @@ size_t copy_to_user_from_crc(char *to, size_t max_read, struct circ_buf* crc) {
 
     rest = copy_to_user(to, crc->buf + crc->tail, to_read);
     transferred = to_read - rest;
-    
+
     crc->tail = (crc->tail + transferred) & (RWCDEV_BUFFER_SIZE - 1);
     return transferred;
 }
@@ -76,11 +79,11 @@ static ssize_t rw_cdevice_read(struct file *file, char *to, size_t max_read, lof
     if (CIRC_CNT(ddata->crc.head, ddata->crc.tail, RWCDEV_BUFFER_SIZE) == 0) {
         return 0;
     }
-    
+
     transferred = copy_to_user_from_crc(to, max_read, &ddata->crc);
     if (transferred == 0) {
         err = ENOMEM;
-        goto fail;   
+        goto fail;
     }
 
     printk("rw_device: read:%d\n", transferred);
@@ -95,22 +98,44 @@ static ssize_t rw_cdevice_write(struct file *file, const char __user *user_buffe
                     size_t size, loff_t * offset)
 {
     int minor = iminor(file_inode(file));
+    int transferred = 0;
     struct rw_cdevice_data *ddata = &device_datas[minor];
-    
+
     printk("rw_cdevice: Device write\n");
-    
-    return copy_from_user_to_crc(user_buffer, size, &ddata->crc);
+
+    if (size == 0) {
+        return 0;
+    }
+
+    transferred = copy_from_user_to_crc(user_buffer, size, &ddata->crc);
+    if (transferred == 0) {
+        return -ENOBUFS;
+    }
+
+    return transferred;
 }
 
 
 static int rw_cdevice_open(struct inode *inode, struct file *file){
-   printk("rw_cdevice: Device open\n");
-   return 0;
+    int minor = iminor(file_inode(file));
+    struct rw_cdevice_data *ddata = &device_datas[minor];
+
+    printk("rw_cdevice: Device open\n");
+
+    if (atomic_cmpxchg(&ddata->busy_flag, 0, 1) != 0) {
+        return -EBUSY;
+    }
+
+    return 0;
 }
 
 static int rw_cdevice_release(struct inode *inode, struct file *file){
-   printk("rw_cdevice: Device closed\n");
-   return 0;
+    int minor = iminor(file_inode(file));
+    struct rw_cdevice_data *ddata = &device_datas[minor];
+
+    printk("rw_cdevice: Device closed\n");
+    atomic_set(&ddata->busy_flag, 0);
+    return 0;
 }
 
 int init_module(void) {
@@ -119,7 +144,7 @@ int init_module(void) {
     int err;
 
     printk("rw_cdevice: init\n");
-    
+
     err = alloc_chrdev_region(&dev, 0, MAX_DEV, RWCDEV_NAME);
     if (err != 0) {
         goto fail;
@@ -130,9 +155,9 @@ int init_module(void) {
     for (int i = 0; i < MAX_DEV; ++i) {
         device_datas[i].crc.buf = device_datas[i].data;
         device_datas[i].crc.head = device_datas[i].crc.tail = 0;
-        
+
         current_dev = &device_datas[i].cdev;
-        
+
         cdev_init(current_dev, &f_ops);
         current_dev->owner = THIS_MODULE;
 
